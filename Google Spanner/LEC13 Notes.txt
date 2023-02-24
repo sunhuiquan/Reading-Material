@@ -1,0 +1,615 @@
+waterbo@yeah.net
+Why this paper (Google Spanner, OSDI 2012)?
+  A rare example of wide-area distributed transactions.
+    Very desirable.
+    But two-phase commit viewed as too slow and prone to blocking.
+  A rare example of wide-area synchronous replication.
+  Neat ideas:
+    Two-phase commit over Paxos.
+    Synchronized time for fast r/o transactions.
+  Used a lot inside Google.
+为什么这篇论文（Google Spanner, OSDI 2012）很重要？
+
+是分布式事务的罕见例子，这是非常有价值的。
+但是两阶段提交被认为太慢且容易被阻塞。
+是分布式同步复制的罕见例子。
+独特的思想：
+在 Paxos 协议上执行两阶段提交。
+同步时间以实现快速的只读事务。
+在 Google 内部被广泛使用。
+
+
+
+waterbo@yeah.net
+翻译以下
+The basic organization:
+  Datacenter A:
+    "clients" are web servers e.g. for gmail
+    data is sharded over multiple servers:
+      a-m
+      n-z
+  Datacenter B:
+    has its own local clients
+    and its own copy of the data shards
+      a-m
+      n-z
+  Datacenter C:
+    same setup
+
+Replication managed by Paxos; one Paxos group per shard.
+  Replicas are in different data centers.
+  Similar to Raft -- each Paxos group has a leader.
+  As in the labs, Paxos replicates a log of operations.
+基本组织结构:
+数据中心 A:
+"客户端"是 Web 服务器，例如 Gmail。
+数据分片存储在多个服务器上：
+a-m
+n-z
+数据中心 B:
+有自己的本地客户端和数据分片的副本
+a-m
+n-z
+数据中心 C:
+相同的设置
+
+复制由 Paxos 管理；每个分片对应一个 Paxos 组。
+副本位于不同的数据中心。
+类似于 Raft —— 每个 Paxos 组都有一个领导者。
+与实验室中的情况类似，Paxos 复制了操作日志。
+
+
+
+
+waterbo@yeah.net
+Why this arrangement?
+  Sharding allows huge total throughput via parallelism.
+  Datacenters fail independently -- different cities.
+  Clients can read local replica -- fast!
+  Can place replicas near relevant customers.
+  Paxos requires only a majority -- tolerate slow/distant replicas.
+为什么采用这种布置？
+
+分片允许通过并行处理实现巨大的总吞吐量。
+数据中心独立失败 —— 不同的城市。
+客户端可以读取本地副本 —— 快速！
+可以将副本放置在相关客户附近。
+Paxos 只需要多数派的支持 —— 可以容忍慢速/远程副本。
+
+
+
+waterbo@yeah.net
+What are the challenges?
+  Read of local replica must yield fresh data.
+    But local replica may not reflect latest Paxos writes!
+  A transaction may involve multiple shards -> multiple Paxos groups.
+  Transactions that read multiple records must be serializable.
+    But local shards may reflect different subsets of committed transactions!
+有哪些挑战？
+
+读取本地副本必须返回最新的数据。
+但是本地副本可能不反映最新的 Paxos 写入！
+一个事务可能涉及多个分片 -> 多个 Paxos 组。
+读取多个记录的事务必须是可串行化的。
+但是本地分片可能反映不同的已提交事务子集！
+
+
+
+waterbo@yeah.net
+Spanner treats read/write and read/only transactions differently.
+
+First, read/write transactions.
+
+Example read/write transaction (bank transfer):
+  BEGIN
+    x = x + 1
+    y = y - 1
+  END
+We don't want any read or write of x or y sneaking between our two ops.
+After commit, all reads should see our updates.
+
+Summary: two-phase commit (2pc) with Paxos-replicated participants.
+  (Omitting timestamps for now.)
+  (This is for r/w transactions, not r/o.)
+  Client picks a unique transaction id (TID).
+  Client sends each read to Paxos leader of relevant shard (2.1).
+    Each shard first acquires a lock on the relevant record.
+      May have to wait.
+    Separate lock table per shard, in shard leader.
+    Read locks are not replicated via Paxos, so leader failure -> abort.
+  Client keeps writes private until commit.
+  When client commits (4.2.1):
+    Chooses a Paxos group to act as 2pc Transaction Coordinator (TC).
+    Sends writes to relevant shard leaders.
+    Each written shard leader:
+      Acquires lock(s) on the written record(s).
+      Log a "prepare" record via Paxos, to replicate lock and new value.
+      Tell TC it is prepared.
+      Or tell TC "no" if crashed and thus lost lock table.
+  Transaction Coordinator:
+    Decides commit or abort.
+    Logs the decision to its group via Paxos.
+    Tell participant leaders and client the result.
+  Each participant leader:
+    Log the TC's decision via Paxos.
+    Release the transaction's locks.
+Spanner 以不同的方式处理读/写和只读事务。
+
+首先是读/写事务。
+
+例如读/写事务（银行转账）：
+BEGIN
+x = x + 1
+y = y - 1
+END
+我们不希望在这两个操作之间出现任何对 x 或 y 的读取或写入。
+提交后，所有读取应该看到我们的更新。
+
+总结：使用 Paxos 复制参与者的两阶段提交（2pc）。
+（暂时忽略时间戳。）
+（这是针对读/写事务而不是只读事务。）
+客户端选择唯一的事务 ID（TID）。
+客户端将每个读取发送到相关分片的 Paxos 领导者（2.1）。
+每个分片首先在相关记录上获取锁。
+可能需要等待。
+每个分片都有一个单独的锁表，在分片领导者中。
+读锁不通过 Paxos 复制，因此领导者故障 -> 中止。
+客户端在提交之前保持写操作私有。
+当客户端提交（4.2.1）：
+选择一个 Paxos 组作为 2pc 事务协调器（TC）。
+将写操作发送到相关的分片领导者。
+每个写入的分片领导者：
+获取写入记录的锁。
+通过 Paxos 记录一个“准备”记录，以复制锁和新值。
+告诉 TC 已准备好。
+或者告诉 TC “不行”，如果崩溃并且因此丢失了锁表。
+事务协调器：
+决定提交或中止。
+通过 Paxos 将决策记录到其组中。
+告诉参与者领导者和客户端结果。
+每个参与者领导者：
+通过 Paxos 记录 TC 的决策。
+释放事务的锁。
+
+
+
+
+waterbo@yeah.net
+Some points about the design so far.
+  Locking (two-phase locking) ensures serializability.
+  2pc widely hated b/c it blocks with locks held if TC fails.
+    Replicating the TC with Paxos solves this problem!
+  r/w transactions take a long time.
+    Many inter-data-center messages.
+    Table 6 suggests about 100 ms for cross-USA r/w transaction.
+    Much less for cross-city (Table 3).
+  But lots of parallelism: many clients, many shards.
+    So total throughput could be high if busy.
+
+From now on I'll mostly view each Paxos group as a single entity.
+  Replicates shard data.
+  Replicates two-phase commit state.
+
+Now for read-only (r/o) transactions.
+  These involve multiple reads, perhaps from multiple shards.
+  We'd like r/o xactions to be much faster than r/w xactions!
+以下是翻译：
+
+关于设计的一些要点：
+
+锁定（两阶段锁定）确保串行化。
+2pc广泛受到憎恨，因为如果TC失败，则会在保持锁的情况下阻塞。
+使用Paxos复制TC解决了这个问题！
+读/写事务需要很长时间。
+许多跨数据中心的消息。
+表6表明，跨美国的读/写事务大约需要100毫秒。
+跨城市的时间则少得多（见表3）。
+但是有很多并行性：许多客户端，许多碎片。
+因此，如果繁忙，总吞吐量可能很高。
+
+从现在开始，我将大多数情况下将每个Paxos组视为单个实体。
+复制碎片数据。
+复制两阶段提交状态。
+
+现在讨论只读（r/o）事务。
+这些事务涉及多次读取，可能来自多个碎片。
+我们希望r/o xaction比r/w xaction快得多！
+
+
+
+
+waterbo@yeah.net
+翻译
+Spanner eliminates two big costs for r/o transactions:
+  Read from local replicas, to avoid Paxos and cross-datacenter msgs.
+    But note local replica may not be up to date!
+  No locks, no two-phase commit, no transaction manager.
+    Again to avoid cross-data center msg to Paxos leader.
+    And to avoid slowing down r/w transactions.
+  Tables 3 and 6 show a 10x latency improvement as a result!
+  How to square this with correctness?
+  
+Correctness constraints on r/o transactions:
+  Serializable:
+    Same results as if transactions executed one-by-one.
+      Even though they may actually execute concurrently.
+    I.e. an r/o xaction must essentially fit between r/w xactions.
+    See all writes from prior transactions, nothing from subsequent.
+  Externally consistent:
+    If T1 completes before T2 starts, T2 must see T1's writes.
+    "Before" refers to real (wall-clock) time.
+    Similar to linearizable.
+    Rules out reading stale data.
+Spanner消除了r/o事务的两个重要成本：
+从本地副本读取，以避免Paxos和跨数据中心消息。
+但请注意，本地副本可能不是最新的！
+没有锁定、没有两阶段提交、没有事务管理器。
+同样是为了避免与Paxos leader的跨数据中心消息。
+并避免减缓r/w事务。
+表3和表6显示了10倍的延迟改进！
+如何使其与正确性相符？
+
+r/o事务的正确性约束：
+可串行化：
+结果与按顺序执行事务相同。
+即使它们实际上可以并发执行。
+例如，r/o事务必须在r/w事务之间执行。
+可以查看之前的所有写入，但不能查看之后的写入。
+外部一致：
+如果T1在T2启动之前完成，则T2必须看到T1的写入。
+“之前”是指实际（挂钟）时间。
+类似于线性化。
+排除读取陈旧数据。
+
+
+
+
+waterbo@yeah.net
+抱歉，我不知道您要我翻译什么内容。请提供要翻译的文本。
+
+
+
+
+waterbo@yeah.net
+翻译
+请提供您需要翻译的文本。
+
+
+
+
+waterbo@yeah.net
+翻译
+Why not have r/o transactions just read the latest committed values?
+  Suppose we have two bank transfers, and a transaction that reads both.
+    T1:  Wx  Wy  C
+    T2:                 Wx  Wy  C
+    T3:             Rx             Ry
+  The results won't match any serial order!
+    Not T1, T2, T3.
+    Not T1, T3, T2.
+  We want T3 to see both of T2's writes, or none.
+  We want T3's reads to *all* occur at the *same* point relative to T1/T2.
+
+Idea: Snapshot Isolation (SI):
+  Synchronize all computers' clocks (to real wall-clock time).
+  Assign every transaction a time-stamp.
+    r/w: commit time.
+    r/o: start time.
+  Execute as if one-at-a-time in time-stamp order.
+    Even if actual reads occur in different order.
+  Each replica stores multiple time-stamped versions of each record.
+    All of a r/w transactions's writes get the same time-stamp.
+  An r/o transaction's reads see version as of xaction's time-stamp.
+    The record version with the highest time-stamp less than the xaction's.
+  Called Snapshot Isolation.
+为什么不让只读事务直接读取最新的提交值呢？
+假设有两个银行转账，以及一个读取两个转账的事务。
+T1：Wx Wy C
+T2：Wx Wy C
+T3：Rx Ry
+结果不会匹配任何串行顺序！
+不是T1，T2，T3。
+也不是T1，T3，T2。
+我们希望T3能看到T2的全部写入，或者全部不看。
+我们希望T3的读取在相对于T1/T2的同一点上全部发生。
+
+想法：快照隔离（SI）：
+将所有计算机的时钟同步（以真实的挂钟时间为准）。
+为每个事务分配一个时间戳。
+r/w：提交时间。
+r/o：开始时间。
+按时间戳顺序执行，好像是一个一个执行的。
+即使实际读取以不同的顺序发生。
+每个副本存储每个记录的多个时间戳版本。
+所有r/w事务的写入都得到相同的时间戳。
+r/o事务的读取会看到与xaction时间戳相对应的版本。
+是小于xaction的最高时间戳版本。
+称为快照隔离（Snapshot Isolation）。
+
+
+
+
+waterbo@yeah.net
+翻译 Our example with Snapshot Isolation:
+                      x@10=9         x@20=8
+                      y@10=11        y@20=12
+    T1 @ 10:  Wx  Wy  C
+    T2 @ 20:                 Wx  Wy  C
+    T3 @ 15:             Rx             Ry
+  "@ 10" indicates the time-stamp.
+  Now T3's reads will both be served from the @10 versions.
+    T3 won't see T2's write even though T3's read of y occurs after T2.
+  Now the results are serializable: T1 T2 T3
+    The serial order is the same as time-stamp order.
+
+Why OK for T3 to read the *old* value of y even though there's a newer value?
+  T2 and T3 are concurrent, so external consistency allows either order.
+  Remember: r/o transactions need to read values
+    as of their timestamp, and *not* see later writes.
+
+Problem: what if T3 reads x from a replica that hasn't seen T1's write?
+  Because the replica wasn't in the Paxos majority?
+
+Solution: replica "safe time".
+  Paxos leaders send writes in timestamp order.
+  Before serving a read at time 20, replica must see Paxos write for time > 20.
+    So it knows it has seen all writes < 20.
+  Must also delay if prepared but uncommitted transactions (Section 4.1.3).
+  Thus: r/o transactions can read from local replica -- usually fast.
+在快照隔离下的示例：
+
+graphql
+Copy code
+                  x@10=9         x@20=8
+                  y@10=11        y@20=12
+T1 @ 10:  Wx  Wy  C
+T2 @ 20:                 Wx  Wy  C
+T3 @ 15:             Rx             Ry
+"@ 10" 表示时间戳。
+现在 T3 的两个读操作都将使用 @10 版本的值。
+即使 T3 在 T2 之后读取了 y，T3 也不会看到 T2 的写入。
+现在结果是可序列化的：T1 T2 T3
+串行顺序与时间戳顺序相同。
+
+为什么对 T3 来说读取 y 的 旧 值是可以的，即使有一个更新的值？
+因为 T2 和 T3 是并发的，所以外部一致性允许任何顺序。
+记住：r/o 事务需要按照它们的时间戳读取值，并且 不 能看到后续的写入。
+
+问题：如果 T3 从一个没有看到 T1 写入的复制品中读取 x 呢？
+因为该副本不在 Paxos 多数派中？
+
+解决方案：复制品的 "安全时间"。
+Paxos 领导者按时间戳顺序发送写入操作。
+在为时间 20 提供读取服务之前，复制品必须看到时间戳 > 20 的 Paxos 写入。
+这样它就知道它已经看到了所有小于 20 的写入。
+如果有准备但未提交的事务（第 4.1.3 节），也必须延迟。
+因此，r/o 事务可以从本地复制品中读取 -- 通常很快。
+
+
+
+
+waterbo@yeah.net
+翻译 Problem: what if clocks are not perfectly synchronized?
+
+What goes wrong if clocks aren't synchronized exactly?
+  No problem for r/w transactions, which use locks.
+  If an r/o transaction's TS is too large:
+    Its TS will be higher than replica safe times, and reads will block.
+    Correct but slow -- delay increased by amount of clock error.
+  If an r/o transaction's TS is too small:
+    It will miss writes that committed before the r/o xaction started.
+    Since its low TS will cause it to use old versions of records.
+    This violates external consistency.
+问题：如果时钟不完全同步会出现什么问题？
+
+如果时钟不同步，会发生什么问题？
+对于使用锁的读写事务没有问题。
+如果只读事务的时间戳（TS）过大：
+它的TS将高于副本的安全时间，读取将被阻塞。
+这是正确的但是速度慢——延迟增加了时钟误差的数量。
+如果只读事务的TS太小：
+它将错过在只读事务开始之前提交的写入。
+因为它的低TS将导致它使用旧版本的记录。
+这违反了外部一致性。
+
+
+
+
+waterbo@yeah.net
+翻译 xample of problem if r/o transaction's TS is too small:
+  r/w T0 @  0: Wx1 C
+  r/w T1 @ 10:         Wx2 C
+  r/o T2 @  5:                   Rx?
+(C for commit)
+This would cause T2 to read the version of x at time 0, which was 1.
+But T2 started after T1 committed (in real time),
+  so external consistency requires that T2 see x=2.
+So there must be a solution to the possibility of incorrect clocks!
+
+Can we synchronize computer clocks perfectly?
+  So that every computer, in every data center, has the same time?
+    I.e. we all agree it's 2:00pm on Tuesday April 7 2020.
+  Not in practice, not perfectly.
+  Time is defined by clocks at a collection of government labs.
+  And distributed by various protocols, e.g. GPS, WWV, NTP.
+  Distribution delays are variable and hard to predict.
+  So there's always uncertainty.
+  Plus the distribution systems may be faulty, without warning.
+问题：如果只读事务的时间戳过小会出现什么问题的示例：
+r/w T0 @ 0: Wx1 C
+r/w T1 @ 10: Wx2 C
+r/o T2 @ 5: Rx?
+（C表示提交）
+这会导致T2读取x在时间0时的版本，即1。
+但T2在T1提交之后开始（按照实际时间），
+因此外部一致性要求T2看到x=2。
+因此，必须有解决方案来避免时钟不准确的可能性！
+
+我们能完美地同步计算机时钟吗？
+使得每台计算机，在每个数据中心，都有相同的时间？
+即我们都同意是2020年4月7日星期二下午2点。
+实际上不可能完美地同步。
+时间是由一系列政府实验室的时钟定义的。
+并通过各种协议（如GPS，WWV，NTP）进行分发。
+分发延迟是可变的且难以预测的。
+因此总是存在不确定性。
+此外，分发系统可能存在故障，而没有警告。
+
+
+
+
+waterbo@yeah.net
+翻译 Google's time reference system (Section 5.3)
+  [UTC, GPS satellites, masters, servers, TTinterval]
+  A few time master servers per data center.
+  Each time master has either a GPS receiver or an "atomic clock".
+  GPS receivers are typically accurate to better than a microsecond.
+  The paper doesn't say what it means by an atomic clock.
+    Probably synced to GPS, but accurate for a while w/o GPS.
+    If coasting, error accumulates, maybe microseconds per week.
+  Other servers talk to a few nearby time masters.
+    Uncertainty due to network delays, drift between checks.
+
+TrueTime
+  Time service yields a TTinterval = [ earliest, latest ].
+  The correct time is guaranteed to be somewhere in the interval.
+  Interval width computed from measured network delays,
+    clock hardware specifications.
+  Figure 6: intervals are usually microseconds, but sometimes 10+ milliseconds.
+  So: server clocks aren't exactly synchronized, but TrueTime
+    provides guaranteed bounds on how wrong a server's clock can be.
+Google的时间参考系统（第5.3节）
+[UTC、GPS卫星、主服务器、从服务器、TTinterval]
+每个数据中心有几个时间主服务器。
+每个时间主服务器有GPS接收器或“原子钟”。
+GPS接收器通常精度高于微秒级。
+论文中没有说明什么是原子钟。
+可能是与GPS同步，但在没有GPS的情况下也可以一段时间内保持准确。
+如果持续使用，误差会积累，可能每周会有微秒级别的误差。
+其他服务器与几个附近的时间主服务器通信。
+由于网络延迟和检查之间的漂移，存在不确定性。
+
+TrueTime
+时间服务产生TTinterval = [最早，最近]。
+保证正确的时间在区间内某个地方。
+区间宽度从测量的网络延迟、时钟硬件规格计算得出。
+图6：间隔通常为微秒级，但有时为10多毫秒。
+因此，服务器时钟并不完全同步，但TrueTime提供了保证服务器时钟偏差的范围。
+
+
+
+
+waterbo@yeah.net
+翻译 How Spanner ensures that if r/w T1 finishes before r/o T2 starts, TS1 < TS2.
+  I.e. that r/o transaction timestamps are not too small.
+  Two rules (4.1.2):
+  Start rule:
+    xaction TS = TT.now().latest
+      for r/o, at start time
+      for r/w, when commit begins
+  Commit wait, for r/w xaction:
+    Before commit, delay until TS < TS.now().earliest
+    Guarantees that TS has passed.
+
+Example updated with intervals and commit wait:
+  The scenario is T1 commits, then T2 starts, T2 must see T1's writes.
+  I.e. we need TS1 < TS2.
+  r/w T0 @  0: Wx1 C
+                   |1-----------10| |11--------------20|
+  r/w T1 @ 10:         Wx2 P           C
+                                 |10--------12|
+  r/o T2 @ 12:                           Rx?
+(P for prepare)
+C guaranteed to occur after its TS (10) due to commit wait.
+Rx occurs after C by assumption, and thus after time 10.
+T2 chooses TT.now().latest, which is after current time, which is after 10.
+So TS2 > TS1.
+
+Why this provides external consistency:
+  Commit wait means r/w TS is guaranteed to be in the past.
+  r/o TS = TT.now().latest is guaranteed to be >= correct time
+    thus >= TS of any previous committed transaction (due to its commit wait)
+
+More generally:
+  Snapshot Isolation gives you serializable r/o transactions.
+    Timestamps set an order.
+    Snapshot versions (and safe time) implement consistent reads at a timestamp.
+    Xaction sees all writes from lower-TS xactions, none from higher.
+    Any number will do for TS if you don't care about external consistency.
+  Synchronized timestamps yield external consistency.
+    Even among transactions at different data centers.
+    Even though reading from local replicas that might lag.
+Spanner如何确保r/w事务完成之后r/o事务开始时，TS1 < TS2?
+即，r/o事务时间戳不会太小。
+两个规则（4.1.2）：
+开始规则：
+对于r/o，在开始时xaction TS = TT.now().latest
+对于r/w，在提交开始时xaction TS = TT.now().latest
+提交等待，对于r/w事务：
+在提交之前，延迟直到TS < TS.now().earliest
+确保TS已经过去。
+
+带有区间和提交等待的示例：
+场景是T1提交，然后T2开始，T2必须看到T1的写入。
+即，我们需要TS1 < TS2。
+r/w T0 @ 0: Wx1 C
+|1-----------10| |11--------------20|
+r/w T1 @ 10: Wx2 P C
+|10--------12|
+r/o T2 @ 12: Rx?
+(P代表Prepare)
+
+由于提交等待，C保证在其TS（10）之后发生。
+Rx根据假设在C之后发生，因此在时间10之后发生。
+T2选择TT.now().latest，该时间晚于当前时间，晚于10。
+因此TS2 > TS1。
+
+为什么这提供了外部一致性：
+提交等待意味着r/w TS保证在过去。
+r/o TS = TT.now().latest保证>=正确时间，因此>=任何先前提交的事务的TS（由于其提交等待）。
+
+更一般地说：
+快照隔离提供可串行化的r/o事务。
+时间戳设置顺序。
+快照版本（和安全时间）在时间戳上实现一致的读取。
+xaction看到所有低TS xaction的写入，没有高TS的写入。
+如果您不关心外部一致性，任何数字都可以作为TS。
+同步的时间戳提供外部一致性。
+即使在不同数据中心的事务之间。
+即使从可能滞后的本地副本读取。
+
+
+
+
+waterbo@yeah.net
+翻译 Why is all this useful?
+  Fast r/o transactions:
+    Read from replica in client's datacenter.
+    No locking, no two-phase commit.
+    Thus the 10x latency improvement in Tables 3 and 6.
+  Although:
+    r/o transaction reads may block due to safe time, to catch up.
+    r/w transaction commits may block in Commit Wait.
+    Accurate (small interval) time minimizes these delays.
+
+Summary:
+  Rare to see deployed systems offer distributed transactions
+    over geographically distributed data.
+  Spanner was a surprising demonstration that it can be practical.
+  Timestamping scheme is the most interesting aspect.
+  Widely used within Google; a commercial Google service; influential.
+为什么这些东西有用？
+快速的 r/o 事务：
+从客户端数据中心的副本中读取。
+没有锁定，没有两阶段提交。
+因此在表格 3 和 6 中看到了 10 倍的延迟改善。
+虽然：
+r/o 事务读取可能会由于安全时间而阻塞，以追赶进度。
+r/w 事务提交可能会在提交等待中阻塞。
+准确的（小间隔）时间可以最大程度地减少这些延迟。
+
+总结：
+很少看到已部署的系统在分布式数据上提供分布式事务。
+Spanner 是一项令人惊讶的证明，表明它可以实用。
+时间戳方案是最有趣的方面。
+在 Google 内得到了广泛的使用；是 Google 的一项商业服务；具有影响力。
